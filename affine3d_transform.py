@@ -1,4 +1,9 @@
+import os
 import numpy as np
+import pandas as pd
+import tifffile
+from scipy.ndimage import affine_transform
+
 
 def compute_affine_transform_3d(em_points, lm_points):
     """
@@ -45,8 +50,6 @@ def compute_affine_transform_3d(em_points, lm_points):
     T[:3, :4] = M.T
 
     return T
-
-from scipy.ndimage import affine_transform
 
 
 def transform_image_stack(image_stack, affine_matrix, **kwargs):
@@ -122,3 +125,69 @@ def transform_points(points, affine_matrix):
     transformed_points = np.dot(homog_points, affine_matrix.T)
     transformed_points = transformed_points[:, :3]
     return transformed_points
+
+
+def transformed_bounds(image_shape, affine_matrix):
+    Z, Y, X = image_shape
+    corners = np.array([
+        [0, 0, 0, 1],
+        [X - 1, 0, 0, 1],
+        [0, Y - 1, 0, 1],
+        [0, 0, Z - 1, 1],
+        [X - 1, Y - 1, 0, 1],
+        [X - 1, 0, Z - 1, 1],
+        [0, Y - 1, Z - 1, 1],
+        [X - 1, Y - 1, Z - 1, 1],
+    ]).T
+    transformed_corners = affine_matrix @ corners
+    transformed_corners = transformed_corners[:3] / transformed_corners[3]
+    mins = np.min(transformed_corners, axis=1)
+    maxs = np.max(transformed_corners, axis=1)
+    return mins, maxs
+
+
+def transform_em_to_lm(
+    em_file,
+    lm_file,
+    landmark_file,
+    output_dir,
+    lm_scale=(1, 1, 1)
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load EM and LM stacks
+    em_stack = tifffile.imread(em_file)
+    lm_stack = tifffile.imread(lm_file)
+
+    # Load landmarks and apply scaling
+    landmarkdf = pd.read_csv(landmark_file, header=0)
+    em_points = landmarkdf[["z_em_subsampled", "y_em_subsampled", "x_em_subsampled"]].values
+    lm_scaled = landmarkdf[['z_lm', 'y_lm', 'x_lm']].copy()
+    lm_scaled['z_lm'] *= lm_scale[0]
+    lm_scaled['y_lm'] *= lm_scale[1]
+    lm_scaled['x_lm'] *= lm_scale[2]
+    lm_points = lm_scaled[['z_lm', 'y_lm', 'x_lm']].values
+
+    # Compute affine transform and its inverse
+    affine3d_mat = compute_affine_transform_3d(em_points, lm_points)
+    inv_affine3d_mat = invert_affine_matrix(affine3d_mat)
+
+    # Determine output shape from LM shape
+    output_shape = np.multiply(lm_stack.shape, lm_scale)  # scale the shape by the landmark scale
+
+    # Apply inverse transformation to EM stack
+    em_transformed = transform_image_stack(
+        em_stack,
+        inv_affine3d_mat,
+        order=1,
+        output_shape=output_shape
+    )
+
+    # Save transformed stack and matrix
+    base_name = os.path.splitext(os.path.basename(em_file))[0]
+    transformed_file_path = os.path.join(output_dir, f'{base_name}_transformed.tif')
+    matrix_file_path = os.path.join(output_dir, f'{base_name}_affine3d_mat.txt')
+    tifffile.imwrite(transformed_file_path, em_transformed)
+    np.savetxt(matrix_file_path, affine3d_mat)
+
+    return affine3d_mat, transformed_file_path
