@@ -13,19 +13,20 @@ from qtpy.QtCore import QTimer
 from functools import partial
 
 from manage_landmarks import LandmarkManager, LandmarkTableWidget
-from compute_affine3d_from_landmarks import transform_points, invert_affine_matrix
+from affine3d_transform import transform_points, invert_affine_matrix
 
 
 def launch_clemgui(
-    em_stack_file,
-    lm_stack_file,
+    em_file,
+    lm_file,
     landmark_file,
     em_affine_file=None,
-    lm_scale=(100, 4, 4)
+    lm_scale=(1, 1, 1),
+    point_size=20
 ):
     # ----------------- Load Data -----------------
-    em_stack = tifffile.imread(em_stack_file)
-    lm_stack = tifffile.imread(lm_stack_file)
+    em_stack = tifffile.imread(em_file)
+    lm_stack = tifffile.imread(lm_file)
 
     if em_affine_file:
         raw_landmark_df = pd.read_csv(landmark_file)
@@ -51,8 +52,18 @@ def launch_clemgui(
     em_layer = viewer.add_image(em_stack, name='EM Stack')
     lm_layer = viewer.add_image(lm_stack, name='LM Stack', scale=lm_scale)
 
-    em_points_layer = viewer.add_points(name='EM Landmarks', ndim=3, size=20, face_color='red', out_of_slice_display=True)
-    lm_points_layer = viewer.add_points(name='LM Landmarks', ndim=3, size=20, face_color='blue', out_of_slice_display=True)
+    em_points_layer = viewer.add_points(name='EM Landmarks', ndim=3, size=20, face_color='red')
+    lm_points_layer = viewer.add_points(name='LM Landmarks', ndim=3, size=20, face_color='yellow')
+
+    lm_points_layer.out_of_slice_display = True
+    em_points_layer.out_of_slice_display = True
+
+    em_points_layer.current_size = point_size
+    lm_points_layer.current_size = point_size
+    em_points_layer.current_face_color = 'red'
+    lm_points_layer.current_face_color = 'yellow'
+    em_points_layer.editable = False
+    lm_points_layer.editable = False
 
     # ----------------- Landmark Management -----------------
     landmark_manager = LandmarkManager()
@@ -69,18 +80,18 @@ def launch_clemgui(
 
     load_landmarks_from_dataframe(landmark_df)
 
-    # ----------------- GUI Controls -----------------
-    class ControlWidget(QWidget):
-        def __init__(self):
-            super().__init__()
-            self.setWindowTitle("Controls")
-            self.layout = QVBoxLayout(self)
-            self.save_button = QPushButton("Save Landmarks")
-            self.save_button.clicked.connect(lambda: landmark_manager.df.to_csv(landmark_file, index=False))
-            self.layout.addWidget(self.save_button)
+    # # ----------------- GUI Controls -----------------
+    # class ControlWidget(QWidget):
+    #     def __init__(self):
+    #         super().__init__()
+    #         self.setWindowTitle("Controls")
+    #         self.layout = QVBoxLayout(self)
+    #         self.save_button = QPushButton("Save Landmarks")
+    #         self.save_button.clicked.connect(lambda: landmark_manager.df.to_csv(landmark_file, index=False))
+    #         self.layout.addWidget(self.save_button)
 
-    control_widget = ControlWidget()
-    viewer.window.add_dock_widget(control_widget, area='right')
+    # control_widget = ControlWidget()
+    # viewer.window.add_dock_widget(control_widget, area='right')
 
     # ----------------- Viewer Status State -----------------
     class ViewerStatus:
@@ -119,19 +130,19 @@ def launch_clemgui(
 
     # ----------------- Key Bindings -----------------
     @viewer.bind_key('c')  # confirmed
-    def _tag_c(viewer): tag_selected_landmark('confirmed')
+    def tag_c(viewer): tag_selected_landmark('confirmed')
 
     @viewer.bind_key('x')  # questioned
-    def _tag_x(viewer): tag_selected_landmark('questioned')
+    def tag_x(viewer): tag_selected_landmark('questioned')
 
     @viewer.bind_key('d')  # delete
-    def _tag_d(viewer): tag_selected_landmark('delete')
+    def tag_d(viewer): tag_selected_landmark('delete')
 
     @viewer.bind_key('Down')
-    def _next(viewer): select_next_landmark()
+    def goto_next_landmark(viewer): select_next_landmark()
 
     @viewer.bind_key('Up')
-    def _prev(viewer): select_previous_landmark()
+    def goto_previous_landmark(viewer): select_previous_landmark()
 
     @viewer.bind_key('w')
     def jump_to_selected_lm(viewer):
@@ -160,10 +171,21 @@ def launch_clemgui(
             viewer.layers.selection.active = em_points_layer
 
     @viewer.bind_key('t')
-    def _toggle_lm(viewer): lm_points_layer.visible = not lm_points_layer.visible
+    def toggle_lm_points_visibility(viewer): lm_points_layer.visible = not lm_points_layer.visible
 
     @viewer.bind_key('y')
-    def _toggle_em(viewer): em_points_layer.visible = not em_points_layer.visible
+    def toggle_em_points_visibility(viewer): em_points_layer.visible = not em_points_layer.visible
+
+    # --- Keybindings for switching to LM/EM quickly ---
+    @viewer.bind_key('u')
+    def display_lm_stack(viewer):
+        viewer.layers['LM Stack'].visible = True
+        viewer.layers['EM Stack'].visible = False
+
+    @viewer.bind_key('i')
+    def display_em_stack(viewer):
+        viewer.layers['EM Stack'].visible = True
+        viewer.layers['LM Stack'].visible = False
 
     # ----------------- Sync Callbacks -----------------
     def on_lm_selection_pair_em(event):
@@ -224,7 +246,7 @@ def launch_clemgui(
         lm_points_layer.selected_data.events.items_changed.connect(on_lm_selection_update_table)
 
     @viewer.bind_key('Space')
-    def _start_add_pair(viewer):
+    def start_adding_pair(viewer):
         status.adding_pair = True
         status.initial_em_count = len(em_points_layer.data)
         status.initial_lm_count = len(lm_points_layer.data)
@@ -233,8 +255,71 @@ def launch_clemgui(
         lm_points_layer.selected_data.events.items_changed.disconnect(on_lm_selection_pair_em)
         lm_points_layer.selected_data.events.items_changed.disconnect(on_lm_selection_update_table)
 
+    # ----------------- EM Landmark Replacement -----------------
+    # Step 1: Press 'r' to initiate EM landmark replacement
+    @viewer.bind_key('r')
+    def initiate_em_landmark_replacement(viewer):
+        selected_rows = table_widget.table.selectionModel().selectedRows()
+        if not selected_rows:
+            print("No landmark selected in the table.")
+            return
+
+        status.replace_landmark_idx = selected_rows[0].row()
+
+        # Switch viewer to EM stack only
+        viewer.layers['EM Stack'].visible = True
+        viewer.layers['LM Stack'].visible = False
+
+        # Activate EM landmarks layer in add mode
+        em_points_layer.mode = 'add'
+        viewer.layers.selection.active = em_points_layer
+
+        print(f"Place a new EM landmark to replace landmark '{landmark_manager.get_landmark_name(status.replace_landmark_idx)}'. Press Esc to cancel.")
+
+
+    # Step 3: Handle the replacement
+    def replace_em_landmark(event):
+        if status.replace_landmark_idx is None:
+            print("No landmark selected for replacement.")
+            return  # Ignore if not in replace mode
+
+        idx = status.replace_landmark_idx
+
+        if len(em_points_layer.data) <= len(landmark_manager.df):
+            return  # Not an addition event, ignore
+
+        new_em_coords = em_points_layer.data[-1]
+
+        print(f'before update em selected data: {em_points_layer.selected_data}')
+        # Replace coordinates at the specific index (preserving landmark indices)
+        em_points_layer.data[idx] = new_em_coords
+        # Disconnect replace_em_landmark to avoid recursion
+        em_points_layer.events.data.disconnect(replace_em_landmark)
+        em_points_layer.data = em_points_layer.data[:-1]  # Remove the extra appended landmark
+        # Select the modified landmark in em_points_layer
+        em_points_layer.selected_data = {idx}
+
+        # Update landmark manager DataFrame
+        landmark_manager.update_landmark_coords(idx, em_coords=new_em_coords)
+
+        # Refresh layers and UI
+        table_widget.update_table()
+        table_widget.table.selectRow(idx)
+
+        print(f"Replaced EM coordinates for landmark '{landmark_manager.get_landmark_name(idx)}' at index {idx}.")
+
+        # Reset EM points layer mode and state
+        em_points_layer.mode = 'pan_zoom'
+        status.replace_landmark_idx = None
+        em_points_layer.events.data.connect(replace_em_landmark)
+        
+    # Connect the permanent callback once
+    em_points_layer.events.data.connect(replace_em_landmark)
+
+
+
     @viewer.bind_key('Escape')
-    def _cancel_add(viewer):
+    def cancel_operations(viewer):
         if status.adding_pair:
             em_points_layer.data = em_points_layer.data[:status.initial_em_count]
             lm_points_layer.data = lm_points_layer.data[:status.initial_lm_count]
@@ -243,4 +328,36 @@ def launch_clemgui(
             status.adding_pair = False
             reconnect_selection()
 
-    napari.run()
+    from qtpy.QtWidgets import QShortcut
+    from qtpy.QtGui import QKeySequence
+    from functools import partial
+
+    # Define each key + its corresponding function (without calling them yet)
+    shortcuts = [
+        ('c', tag_c),
+        ('x', tag_x),
+        ('d', tag_d),
+        ('w', jump_to_selected_lm),
+        ('e', jump_to_selected_em),
+        ('Down', goto_next_landmark),
+        ('Up', goto_previous_landmark),
+        ('t', toggle_lm_points_visibility),
+        ('y', toggle_em_points_visibility),
+        ('r', initiate_em_landmark_replacement),
+        ('Escape', cancel_operations),
+        ('u', display_lm_stack),
+        ('i', display_em_stack),
+        ('Space', start_adding_pair),
+    ]
+
+    # Create a list to hold references to the shortcuts (so they don’t get garbage-collected)
+    table_widget.shortcuts = []
+
+    for key, func in shortcuts:
+        shortcut = QShortcut(QKeySequence(key), table_widget)
+        # Use functools.partial to pass the 'viewer' argument into the function
+        shortcut.activated.connect(partial(func, viewer))
+        table_widget.shortcuts.append(shortcut)
+
+
+    return viewer, landmark_manager
